@@ -104,19 +104,6 @@ Target monthly cost at MVP scale (free-tier aware): **~$60–80**. Full scaling 
 
 ---
 
-## Screenshots
-
-### Dashboard
-![Dashboard](./assets/dashboard.png)
-
-### Campaign Creation
-![Campaign](./assets/campaign.png)
-
-### Email Review (Human-in-the-Loop)
-![Review](./assets/review.png)
-
----
-
 ## About This Repository
 
 This is a **public architecture overview**. The source code is in a private repository.
