@@ -1,212 +1,248 @@
 # Architecture
 
-This document describes the high-level architecture of Agentheon, the design decisions behind it, and the trade-offs involved.
+System design of Agentheon. Focus: real architectural decisions and why they were made.
+
+> Public overview. Source code is private.
 
 ---
 
-## Design Goals
+## Design Principles
 
-1. **Modularity** — Each part of the pipeline (research, generation, sending, tracking) is an independent component that can be developed, tested, and replaced in isolation.
-2. **Observability** — Every agent execution, email event, and system error is traceable. If something goes wrong, you can see exactly where and why.
-3. **Human control** — Automation handles the heavy lifting, but humans make the final call on what gets sent.
-4. **Deliverability as infrastructure** — Domain health and sending capacity are managed at the system level, not left to the user to figure out.
+1. **Compounding learning over static prompts** — every campaign makes the next one better without per-customer fine-tuning.
+2. **Async everything on hot paths** — API never blocks on LLM calls. Workers do the heavy lifting.
+3. **State machine over ad-hoc logic** — campaign transitions are explicit and validated.
+4. **Observability from day one** — every LLM call traced, every webhook event logged, every error captured.
+5. **Modular monolith** — clear internal boundaries, single deploy unit. Microservices are a future option, not a starting point.
 
 ---
 
-## System Overview
+## Component Topology
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Frontend                             │
-│                  Next.js · TypeScript                        │
-│         React Query · Socket.IO · shadcn/ui                 │
-│                                                             │
-│  ┌───────────┐  ┌────────────┐  ┌────────────┐             │
-│  │ Dashboard  │  │ Campaign   │  │ Review     │             │
-│  │ & Metrics  │  │ Builder    │  │ Interface  │             │
-│  └───────────┘  └────────────┘  └────────────┘             │
-└────────────────────────┬────────────────────────────────────┘
-                         │ REST + WebSocket
-┌────────────────────────▼────────────────────────────────────┐
-│                     Backend API                             │
-│                  Python · FastAPI                            │
-│                                                             │
-│  ┌───────────┐  ┌────────────┐  ┌────────────┐             │
-│  │ Campaign   │  │ Auth       │  │ Webhook    │             │
-│  │ Management │  │ (Auth0)    │  │ Handlers   │             │
-│  └─────┬─────┘  └────────────┘  └─────┬──────┘             │
-│        │                               │                    │
-│  ┌─────▼──────────────────────────────▼──────┐             │
-│  │          Agent Workflow Layer              │             │
-│  │       LangChain · LangGraph               │             │
-│  │                                           │             │
-│  │  Research → Enrichment → Copywriting      │             │
-│  └─────────────────┬─────────────────────────┘             │
-│                    │                                        │
-│  ┌─────────────────▼─────────────────────────┐             │
-│  │        Deliverability Layer                │             │
-│  │    CAO · Domain Warmup · Send Limits      │             │
-│  └───────────────────────────────────────────┘             │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-         ┌───────────────┼───────────────┐
-         ▼               ▼               ▼
-   ┌──────────┐   ┌──────────┐   ┌──────────────┐
-   │PostgreSQL│   │  Redis   │   │Email Provider│
-   │          │   │  (ARQ)   │   │              │
-   └──────────┘   └──────────┘   └──────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                       Browser (Client)                                │
+│           Next.js · TypeScript · React Query · Socket.IO             │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │ HTTPS (REST + WebSocket)
+┌────────────────────────────▼─────────────────────────────────────────┐
+│                    Next.js Server (Auth Proxy)                        │
+│       NextAuth (Google OAuth, JWE)  →  HS256 JWT to backend          │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────────────────┐
+│                     Backend API (FastAPI)                             │
+│                                                                       │
+│   Campaign CRUD · Approval · Webhooks · Socket.IO bridge             │
+│   JWT validation · Ownership checks · State machine · Rate limits    │
+└──────┬─────────────────────┬─────────────────────┬───────────────────┘
+       │ enqueue             │ write               │ publish
+       ▼                     ▼                     ▼
+┌──────────────┐   ┌──────────────────┐   ┌────────────────────┐
+│ Redis (ARQ)  │   │   PostgreSQL     │   │ Redis (Pub/Sub)    │
+│              │   │   + pgvector     │   │                    │
+│ Job queue    │   │                  │   │ Real-time events   │
+└──────┬───────┘   │ • Campaigns      │   └──────────▲─────────┘
+       │ dequeue   │ • Contacts       │              │ publish
+       ▼           │ • Drafts         │              │
+┌──────────────┐   │ • Email logs     │              │
+│ ARQ Workers  │───┤ • Bandit stats   │──────────────┘
+│              │   │ • Semantic mem   │
+│ Import       │   │ • LG checkpoints │
+│ Enrich       │   │ • Idempotency    │
+│ Generate     │   └──────────────────┘
+│ Send         │
+│ Learn        │
+└──────┬───────┘
+       │ external APIs
+       ▼
+┌──────────────────────────────────────────────────┐
+│ OpenAI · Tavily · Perplexity · Resend · Apollo   │
+│ LangSmith · Sentry                                │
+└──────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Frontend
+## The Learning Loop
 
-**Next.js (Pages Router) · TypeScript · React Query v5 · Tailwind · shadcn/ui**
+The architectural differentiator. Three tiers, all operational.
 
-The frontend is a single-page application responsible for:
+### Tier 1 — Prompt-Level Learning (Real-Time SQL)
 
-- **Campaign management** — creating campaigns, selecting prospect sources, configuring sending parameters
-- **Email review** — displaying generated emails for human approval, with edit and reject actions
-- **Real-time dashboard** — live metrics for opens, replies, bounces, streamed via Socket.IO
-- **Domain management** — visibility into domain health and sending capacity
+Before generating each email, `EmailPerformanceAnalyzer` runs three queries scoped to the user's history:
 
-State management uses React Query with optimistic updates. Real-time events arrive through a persistent WebSocket connection and trigger cache invalidations so the UI stays current without polling.
+1. Top-performing past emails for the target segment (industry + title)
+2. Subject line pattern stats (open rate, reply rate per pattern)
+3. Anti-patterns from bounced/complained emails
 
----
+Results are formatted into a `PERFORMANCE INSIGHTS` section of the prompt. Cold start is handled — first-time users skip injection gracefully.
 
-## Backend API
+### Tier 2 — Multi-Armed Bandit for Subject Lines
 
-**Python · FastAPI**
+`SubjectLineBandit` — Thompson Sampling over Beta(α, β) distributions, implemented with numpy.
 
-The API layer handles:
+- 3 default styles per campaign: question · specific-interest · common-ground
+- State persisted per campaign in `subject_variant_stats`
+- Each send: `np.random.beta(α, β)` selects the variant
+- Open webhook event: atomic `UPDATE α = α + 1`
+- Converges to the best variant within ~50 sends per campaign
 
-- **Campaign lifecycle** — state machine managing campaign creation, activation, pausing, and completion
-- **Authentication** — Auth0 integration with JWT validation
-- **Webhook ingestion** — receiving delivery events (opens, clicks, bounces, replies) from the email provider and writing them to the database
-- **Agent job dispatch** — queuing research and generation tasks to async workers via Redis/ARQ
-- **WebSocket broadcasting** — pushing real-time events to connected frontend clients
+### Tier 3 — Semantic Memory (pgvector)
 
-The API does not run agent workflows synchronously. All AI-related work is dispatched to background workers to keep API response times predictable.
+After campaigns run, `EmailInsightStore.extract_campaign_insights` converts winning patterns into natural language, embeds with `text-embedding-3-small` (512d), and stores with HNSW index.
 
----
+Future campaigns query by audience similarity; top-3 results are injected as a `SEMANTIC INSIGHTS` prompt section. Stored per-user (FK to `sdr_users`), so insights are private.
 
-## Database — PostgreSQL
+### Closing the Loop via LangSmith
 
-PostgreSQL is the system of record for:
+Every email draft stores `generation_metadata` with `trace_id`, `input_tokens`, `output_tokens`, `model`, `prompt_version`, `variant_id`, `generation_time_ms`.
 
-- Campaigns, prospects, and generated emails
-- Email event history (opens, replies, bounces)
-- Domain configuration and sending capacity state
-- User accounts and settings
+When Resend webhooks fire:
 
-The schema is designed around the campaign lifecycle — prospects move through defined states (imported → researched → generated → reviewed → sent → tracked) and each transition is recorded.
+| Event | LangSmith score |
+|-------|----------------|
+| `replied` | 1.0 |
+| `clicked` | 0.7 |
+| `opened` | 0.3 |
+| `bounced` / `complained` | -1.0 |
 
----
-
-## Async Workers — Redis / ARQ
-
-Long-running tasks are processed by ARQ workers backed by Redis:
-
-- **Research jobs** — agent-based prospect research and enrichment
-- **Generation jobs** — email copywriting using LLM pipelines
-- **Sending jobs** — email dispatch respecting CAO capacity limits
-- **Analytics processing** — aggregating webhook events into campaign-level metrics
-
-This keeps the API responsive and allows the system to process large prospect lists without blocking.
+Scores flow through `langsmith.Client.create_feedback` asynchronously. Low-scoring traces surface bad prompts for review. High-scoring traces surface patterns worth extracting to Tier 3.
 
 ---
 
-## Agent Workflow Layer
+## Composable Prompts
 
-**LangChain · LangGraph**
+The EmailAgent prompt is not a monolithic string. It's assembled from independent sections with defined cache semantics:
 
-The core AI pipeline is built as a directed graph of specialized agents:
+| Section | Volatility | Contents |
+|---------|-----------|----------|
+| base_instructions | cacheable | Role, format, structured output schema |
+| campaign_type | cacheable | Job-search vs sales-outreach vs networking |
+| tone_guidelines | cacheable | Voice, formality, CTA style |
+| compliance_rules | cacheable | Anti-spam, length limits |
+| performance_insights | volatile | Tier 1 SQL results |
+| semantic_insights | volatile | Tier 3 pgvector results |
+| few_shot_examples | volatile | Real past winners for audience |
+| bandit_variant | volatile | Tier 2 selected style instruction |
+| contact_context | volatile | Enrichment data for this prospect |
 
-1. **Research Agent** — gathers prospect and company context from external sources
-2. **Enrichment Agent** — structures and scores the research output
-3. **Copywriting Agent** — generates personalized emails grounded in the enriched data
+Cacheable sections are identical across a campaign's 50+ emails — ready for Anthropic prompt caching once the system migrates off GPT-5-mini. Volatile sections change per contact.
 
-Each agent is:
-- **Independently testable** — can be run in isolation with mocked inputs
-- **Traced** — every execution is logged to LangSmith with full input/output visibility
-- **Configurable** — model selection, prompts, and parameters are adjustable per agent
-
-The graph topology is managed by LangGraph, which handles state transitions, conditional branching, and error recovery within the pipeline.
+Output is structured JSON via `bind_tools` (`EmailOutput` Pydantic model with `subject`, `body_html`, `body_text`, `personalization_score`, `reasoning`).
 
 ---
 
-## Human-in-the-Loop
+## Agent System
 
-The review system sits between generation and sending:
+LangGraph-based orchestration:
 
 ```
-Agent generates email → Email enters review queue → User approves/edits/rejects → Approved emails enter send queue
+Orchestrator → Navigator → Planner → Coordinator → [Specialized Agents]
 ```
 
-This is not optional — every email passes through review before sending. The review interface shows the generated content alongside the research context that informed it, so users can judge whether the personalization is accurate.
+- **Orchestrator** — top-level workflow entry, owns the LangSmith trace context
+- **Navigator** — LLM-based intent interpretation, handles clarification requests
+- **DynamicSalesPlanner** — generates execution plans with tool/agent validation
+- **Coordinator** — executes plans via LangGraph with dynamic graph building
+- **EmailAgent** — the only agent in the generation hot path. Composable prompts, structured output
+- **ResearchAgent** — Tavily + Perplexity (scaffolded; full wiring in progress)
+- **Tool Registry** — Pydantic-validated, dynamic discovery
 
-Rejected emails can be regenerated with adjusted parameters.
+LangGraph workflow state persists via `AsyncPostgresSaver` — generation paused for human review can resume hours or days later across worker restarts.
 
 ---
 
-## Deliverability Layer — CAO
+## Campaign State Machine
 
-The Capacity Allocation Optimizer (CAO) manages sending at the domain level:
+```
+DRAFT → IMPORTING → ENRICHING → GENERATING → REVIEWING → SCHEDULED → ACTIVE → COMPLETED
+                                     ↓                      ↓
+                                  PAUSED ← ─ ─ ─ ─ ─ ─ ─ PAUSED
+```
 
-- **Domain warm-up** — new domains start with low daily sending limits that increase gradually as reputation builds
-- **Capacity allocation** — available daily capacity is split between campaign emails and warm-up traffic
-- **Health monitoring** — bounce rates and complaint signals feed back into capacity adjustments
-- **Multi-domain distribution** — campaigns can spread volume across multiple sending domains to reduce per-domain risk
+Contact-level state machine runs in parallel: `IMPORTED → ENRICHED → GENERATED → APPROVED → QUEUED → SENT → DELIVERED/OPENED/CLICKED/REPLIED/BOUNCED`.
 
-The CAO runs as part of the sending pipeline and enforces limits before any email reaches the provider.
+**Rule**: direct status updates are forbidden. All transitions go through `CampaignStateMachine.transition()` which validates source→target legality and runs post-transition hooks.
 
 ---
 
-## Analytics + Webhooks
-
-Email events flow through webhooks from the email provider:
+## Real-Time Architecture
 
 ```
-Email Provider → Webhook endpoint → Event processing → Database → WebSocket → Dashboard
+Worker fires event
+   → Redis PUBLISH "orchestration:updates:<campaign_id>"
+      → API Pub/Sub listener (long-lived asyncio task)
+         → Socket.IO (Redis adapter for multi-instance)
+            → Browser room: campaign_<id> or sdr_global
 ```
 
-Events are processed asynchronously and written to PostgreSQL. Aggregated metrics (open rate, reply rate, bounce rate) are computed and pushed to the frontend via WebSocket so the dashboard updates in real time.
+Everything that matters in the UI comes through this pipeline: generation progress, webhook events, approval requests, campaign status. Polling is a 30s fallback only.
+
+The Socket.IO Redis adapter is essential — without it, horizontally scaling the API breaks real-time delivery. The ALB uses sticky sessions (cookie `io`) because Socket.IO's HTTP polling→WebSocket upgrade requires consistent backend affinity.
 
 ---
 
-## Observability
+## Observability Stack
 
-| Tool | Purpose |
+| Tool | Coverage |
 |------|---------|
-| LangSmith | Agent execution tracing — full visibility into every step of the AI pipeline |
-| Sentry | Error tracking with alert rules for critical failures |
-| Vercel Analytics | Frontend performance and user behavior |
-| Application logs | Structured logging across all backend services |
+| LangSmith | Every LLM call. Full I/O. Feedback scores from webhooks. Per-trace cost tracking |
+| Sentry | Backend + frontend error tracking. 10 pre-configured alert rules |
+| Loguru | Structured logs with a PII-sanitization filter on every line |
+| Vercel Analytics | Frontend user behavior |
+| CloudWatch (AWS target) | Infra-level logs, metrics, alarms |
 
-The goal is that when something fails — an agent produces bad output, an email bounces unexpectedly, a webhook is malformed — you can trace the full chain from user action to system response.
+Per-email `generation_metadata` enables analysis queries like "what's my cost-per-reply for gpt-5-mini vs gpt-4.1?" or "which prompt_version has the best performance_score?"
 
 ---
 
-## Deployment
+## Resilience Patterns
 
-| Component | Platform | Rationale |
-|-----------|----------|-----------|
-| Backend API + Workers | Railway | Simple container deployment, built-in PostgreSQL and Redis, easy scaling |
-| Frontend | Vercel | Native Next.js support, edge caching, zero-config deploys |
-| Auth | Auth0 | Managed authentication, JWT-based, avoids building auth from scratch |
+- **Retry with exponential backoff** — every external API call (OpenAI 429, Resend 5xx, Tavily timeouts, Apollo rate limits)
+- **Webhook idempotency** — Resend sends duplicates; SHA256 hash stored in `processed_webhook_events` prevents double-processing
+- **Circuit breaker** — campaign auto-pauses after 3 consecutive send failures
+- **Connection pooling** — explicitly tuned (size=20, overflow=10, recycle=3600) to prevent exhaustion under load
+- **Controlled parallelism** — email generation runs 5 concurrent LLM calls via `asyncio.Semaphore`, balancing throughput against rate limits
+- **Graceful fallback** — missing API keys degrade to mock mode in development, not crash
+
+---
+
+## Data Model Highlights
+
+27 Alembic migrations, all auto-generated, with explicit constraint naming conventions for migration consistency.
+
+Notable tables:
+
+| Table | Purpose |
+|-------|---------|
+| `sdr_campaigns` | Campaign state, settings (JSONB), counters |
+| `sdr_campaign_contacts` | Per-contact state, enrichment data (JSONB), generation metadata (JSONB) |
+| `email_drafts` | Pre-send drafts with approval state, revised subject/body |
+| `email_logs` | Delivery tracking (resend_email_id, status, timestamps, open/click counts) |
+| `subject_variant_stats` | Bandit state (α, β) per campaign variant |
+| `email_insights` | pgvector store (512d embeddings, HNSW index, FK to user) |
+| `processed_webhook_events` | Idempotency hashes |
+| `rate_limit_usage` | Daily/hourly send tracking per user |
+| LangGraph checkpoint tables | `checkpoint_blobs`, `checkpoint_migrations`, `checkpoint_writes`, `checkpoints` |
+
+Sensitive fields (API keys, OAuth tokens) are Fernet-encrypted at rest.
 
 ---
 
 ## Key Trade-offs
 
-### Flexibility vs. Control
-The agent pipeline uses LangGraph for flexible orchestration, but the overall campaign flow follows a strict state machine. Agents can adapt within their step; the system enforces the sequence.
+### Prompt injection over fine-tuning
 
-### Automation vs. Trust
-The system generates emails automatically but requires human approval before sending. This adds friction to the workflow but prevents bad emails from reaching prospects — a trade-off that's worth it when domain reputation is at stake.
+Competitors fine-tune per customer. Agentheon injects historical data into prompts. Bet: prompt injection is faster, cheaper, transferable across models, and — with multi-tier feedback — produces comparable results without per-customer retraining cost.
 
-### Speed vs. Deliverability
-The CAO could send more emails faster, but throttles volume to protect domain health. Short-term throughput is sacrificed for long-term sending capacity.
+### Human-in-the-loop, always
 
-### Monolith vs. Microservices
-The backend is a modular monolith — logically separated components (API, workers, agents, CAO) in a single deployable unit. This allows faster iteration and lower operational overhead than a distributed setup, while maintaining clear internal boundaries that make future extraction straightforward if needed.
+Every email requires explicit approval. Adds friction. But: sending reputation takes months to build and seconds to destroy, and an LLM hallucinating a compliment about the wrong company gets the domain mass-reported. Review is the feature.
+
+### Modular monolith over microservices
+
+One codebase, one deploy unit, clear boundaries between API / agents / workers / feedback. Extraction is possible later; premature decomposition is a cost that pays nothing at current scale.
+
+### Fargate over Kubernetes
+
+For the AWS migration: ECS Fargate, not EKS. With three deployable services and one engineer, Kubernetes is overhead without benefit. The conceptual model (task definitions, services, target groups) maps cleanly to Kubernetes if scale later demands it.
